@@ -4,8 +4,6 @@ applyTo: "**"
 # Project general coding standards
 
 ## Naming Conventions
-- Use PascalCase for component names, interfaces, and type aliases
-- Use camelCase for variables, functions, and methods
 - Prefix private class members with underscore (_)
 - Use ALL_CAPS for constants
 
@@ -14,5 +12,10 @@ applyTo: "**"
 - Implement proper error boundaries in React components
 - Always log errors with contextual information
 
-## Answer requirements
+## Programming Paradigm
+- Each function must have a concise description of its functionality, inputs, and outputs
+- Each class must have a concise description of its purpose and usage
+- Always think about code reusability and maintainability
+
+## Answer Requirements
 - Answer me in chinese
