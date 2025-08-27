@@ -7,11 +7,6 @@ applyTo: "**"
 - Prefix private class members with underscore (_)
 - Use ALL_CAPS for constants
 
-## Error Handling
-- Use try/catch blocks for async operations
-- Implement proper error boundaries in React components
-- Always log errors with contextual information
-
 ## Programming Paradigm
 - Each function must have a concise description of its functionality, inputs, and outputs
 - Each class must have a concise description of its purpose and usage

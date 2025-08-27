@@ -173,7 +173,8 @@ class DQNAgent:
 
 class REINFORCE:
 
-    def __init__(self, action_size: int = 2, gamma: float = 0.98, lr: float = 2e-4, device: str | None = None):
+    def __init__(self, action_size: int = 2, gamma: float = 0.98, lr: float = 2e-4, device: str | None = None,
+                 update_freq=64):
         self.gamma = gamma
         self.lr = lr
         self.action_size = action_size
@@ -182,19 +183,26 @@ class REINFORCE:
         self.memory: list[tuple[float, torch.Tensor]] = []
         self.pi = PolicyNet(self.action_size).to(self.device)
         self.optimizer = optim.Adam(self.pi.parameters(), lr=self.lr)
+        self.T = 0
+        self.update_freq = update_freq
 
+    def eval(self):
+        self.pi.eval()
 
     def get_action(self, state):
         """给定状态采样一个动作。
         输入: state(ndarray|Tensor) -> (action:int, prob_selected:Tensor)
         """
         state_t = state if torch.is_tensor(state) else torch.as_tensor(state, dtype=torch.float32)
+        if state_t.dim() == 1:
+            state_t = state_t.unsqueeze(0)
         state_t = state_t.to(self.device)
         probs = self.pi(state_t)  # (A,)
-        # 用分布采样，避免 numpy 来回转换
+
         m = Categorical(probs=probs)
-        action = m.sample().item()
-        return action, probs[action]
+        actions = m.sample() 
+        probs_selected = probs[torch.arange(probs.size(0)), actions]
+        return actions.cpu().numpy(), probs_selected
 
     def add(self, reward, prob):
         """缓存一条(reward, prob_selected) 轨迹项。"""
@@ -204,7 +212,7 @@ class REINFORCE:
         """基于 REINFORCE 目标: L = -sum_t log(pi(a_t|s_t)) * G_t"""
         if not self.memory:
             return 0.0
-        self.optimizer.zero_grad()
+        
 
         G = 0.0
         loss = torch.zeros((), device=self.device)
@@ -214,11 +222,15 @@ class REINFORCE:
             loss = loss + (-torch.log(prob + 1e-8) * G)
 
         loss.backward()
-        self.optimizer.step()
+        self.T += 1
         self.memory = []
+
+        if self.T % self.update_freq == 0:
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+
         return float(loss.detach().cpu().item())
     
-
 
 class ActorCritic:
     """
@@ -244,9 +256,9 @@ class ActorCritic:
         probs = self.pi(state)
         probs = probs[0]
         
-        m = torch.distributions.Categorical(probs)
-        action = m.sample()
-        return action.item(), probs
+        m = Categorical(probs=probs)
+        action = m.sample().item()
+        return action, probs
 
     def update(self, state, action, action_probs, reward, next_state, done):
         state = state[np.newaxis, :]  # add batch axis
