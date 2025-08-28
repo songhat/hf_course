@@ -8,6 +8,7 @@ import random
 from torchvision import transforms
 from network import MLP_QNet, CNN_QNet, PolicyNet, ValueNet
 from torch.distributions import Categorical
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 class UnsqueezeTransform:
     def __call__(self, x):
@@ -63,10 +64,12 @@ class QLearningAgent:
     
 
 class ReplayBuffer:
-    def __init__(self, buffer_size, batch_size, use_cnn):
+    def __init__(self, buffer_size, batch_size, use_cnn, transforms=None, device='cuda'):
         self._buffer = deque(maxlen=buffer_size)
         self._batch_size = batch_size
         self.use_cnn = use_cnn
+        self.transforms = transforms
+        self._device = device
 
     def add(self, state, action, reward, next_state, done):
         self._buffer.append((state, action, reward, next_state, done))
@@ -86,20 +89,32 @@ class ReplayBuffer:
             state = np.stack([x[0] for x in batch])
             next_state = np.stack([x[3] for x in batch])
         done = np.array([x[4] for x in batch]).astype(np.float32)
+        
+        action = torch.LongTensor(action).to(self._device)
+        reward = torch.FloatTensor(reward).to(self._device)
+        state = torch.FloatTensor(state).to(self._device)
+        next_state = torch.FloatTensor(next_state).to(self._device)
+        done = torch.FloatTensor(done).to(self._device)
         return state, action, reward, next_state, done
 
 class DQNAgent:
-    def __init__(self, lr=0.0001, epsilon=0.1, batch_size=32, state_size=8, action_size=4, device='cuda',use_cnn=False,image_shape=(84, 84)):
-        self.gamma = 0.98
+    
+    """
+    off-policy、基于价值、时序差分、经验回访
+    todo : Soft Updates (Polyak Averaging)
+    """
+
+    def __init__(self, lr=0.001, epsilon=0.5, batch_size=32, buffer_size=512, action_size=4, device='cuda',use_cnn=False,
+                 image_shape=(84, 84)):
+        self.gamma = 0.99
         self.lr = lr
         self.epsilon = epsilon
-        self.buffer_size = 10000
+        self.buffer_size = buffer_size
         self.batch_size = batch_size
         self.action_size = action_size
 
         self._device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.use_cnn = use_cnn
-        self._replay_buffer = ReplayBuffer(self.buffer_size, self.batch_size, self.use_cnn)
         if self.use_cnn:
             QNet = CNN_QNet()
             self.transforms = transforms.Compose([
@@ -111,11 +126,28 @@ class DQNAgent:
                 UnsqueezeTransform()
             ])
         else:
-            QNet = MLP_QNet(state_size, action_size)
+            QNet = MLP_QNet(action_size)
+            self.transforms = None
+        self._replay_buffer = ReplayBuffer(self.buffer_size, self.batch_size, self.use_cnn,self.transforms,self._device)
+
         self.qnet = QNet.to(self._device)
         self.qnet_target = QNet.to(self._device)
         self.optimizer = optim.Adam(self.qnet.parameters(), lr=self.lr)
-        self.loss_fn = nn.MSELoss()
+        self.scheduler = CosineAnnealingLR(self.optimizer,T_max=5000)
+        self.loss_fn = nn.SmoothL1Loss()
+
+
+    def eval(self):
+        self.qnet.eval()
+    
+    def train(self):
+        self.qnet.train()
+
+    def save(self, path):
+        torch.save(self.qnet.state_dict(), path)
+    
+    def load(self, path):
+        self.qnet.load_state_dict(torch.load(path))
 
     def get_action(self, state):
         # 如果是CNN，自动做transform
@@ -123,45 +155,47 @@ class DQNAgent:
             state = self.transforms(state)
             state = state.unsqueeze(0) if state.dim() == 3 else state  # (C,H,W) -> (1,C,H,W)
         else:
-            state = torch.FloatTensor(state) if not torch.is_tensor(state) else state
-        state = state.to(self._device)
+            state_t = torch.FloatTensor(state) if not torch.is_tensor(state) else state
+        state_t = state_t.to(self._device)
+        if state.ndim == 1:
+            state_t = state_t.unsqueeze(0)
+
+        self.epsilon = max(0.01, self.epsilon * 0.995) # 探索衰减
         if np.random.rand() < self.epsilon:
-            return np.random.choice(self.action_size)
+            return np.random.choice(self.action_size), 0 # 动作，Q值(用0先代替)
         else:
             with torch.no_grad():
-                qs = self.qnet(state)
-                return qs.argmax().item()
-
+                qs = self.qnet(state_t)
+                if state.ndim == 1:
+                    qs = qs.squeeze(0)
+                    return qs.argmax().item(), 0 # 动作， Q值(用0先代替)
+                else:
+                    return qs.argmax().item(), 0 # 动作， Q值(用0先代替)
     def update(self, state, action, reward, next_state, done):
         self._replay_buffer.add(state, action, reward, next_state, done)
         if len(self._replay_buffer) < self.batch_size:
             return 0.0
 
-        state_batch, action_batch, reward_batch, next_state_batch, done_batch = self._replay_buffer.get_batch(self.transforms)
+        state, action, reward, next_state, done = self._replay_buffer.get_batch()
         # CNN输入批量transform
         if not self.use_cnn:
-            state_batch = torch.FloatTensor(state_batch) if not torch.is_tensor(state_batch) else state_batch
-            next_state_batch = torch.FloatTensor(next_state_batch) if not torch.is_tensor(next_state_batch) else next_state_batch
+            state = torch.FloatTensor(state) if not torch.is_tensor(state) else state
+            next_state = torch.FloatTensor(next_state) if not torch.is_tensor(next_state) else next_state
 
-        action_batch = torch.LongTensor(action_batch).to(self._device)
-        reward_batch = torch.FloatTensor(reward_batch).to(self._device)
-        done_batch = torch.FloatTensor(done_batch).to(self._device)
-        state_batch = state_batch.to(self._device)
-        next_state_batch = next_state_batch.to(self._device)
-
-        qs = self.qnet(state_batch)
-        q = qs.gather(1, action_batch.unsqueeze(1)).squeeze(1)
+        qs = self.qnet(state)
+        q = qs.gather(1, action.unsqueeze(1)).squeeze(1)
 
         with torch.no_grad():
-            next_qs = self.qnet_target(next_state_batch)
+            next_qs = self.qnet_target(next_state)
             next_q = next_qs.max(dim=1)[0]
-            target = reward_batch + (1 - done_batch) * self.gamma * next_q
+            target = reward + (1 - done) * self.gamma * next_q
 
         loss = self.loss_fn(q, target)
 
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+        self.scheduler.step()
 
         return loss.item()
 
@@ -172,9 +206,10 @@ class DQNAgent:
 
 
 class REINFORCE:
+    "on-policy、基于策略、蒙特卡洛"
 
     def __init__(self, action_size: int = 2, gamma: float = 0.98, lr: float = 2e-4, device: str | None = None,
-                 update_freq=64):
+                 ):
         self.gamma = gamma
         self.lr = lr
         self.action_size = action_size
@@ -183,11 +218,13 @@ class REINFORCE:
         self.memory: list[tuple[float, torch.Tensor]] = []
         self.pi = PolicyNet(self.action_size).to(self.device)
         self.optimizer = optim.Adam(self.pi.parameters(), lr=self.lr)
-        self.T = 0
-        self.update_freq = update_freq
+        self.scheduler = CosineAnnealingLR(self.optimizer,T_max=5000)
 
     def eval(self):
         self.pi.eval()
+    
+    def train(self):
+        self.pi.train()
 
     def get_action(self, state):
         """给定状态采样一个动作。
@@ -212,7 +249,6 @@ class REINFORCE:
         """基于 REINFORCE 目标: L = -sum_t log(pi(a_t|s_t)) * G_t"""
         if not self.memory:
             return 0.0
-        
 
         G = 0.0
         loss = torch.zeros((), device=self.device)
@@ -221,14 +257,11 @@ class REINFORCE:
             # 数值稳定性，小常数避免 log(0)
             loss = loss + (-torch.log(prob + 1e-8) * G)
 
+        self.optimizer.zero_grad()
         loss.backward()
-        self.T += 1
+        self.optimizer.step()
+        self.scheduler.step()
         self.memory = []
-
-        if self.T % self.update_freq == 0:
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-
         return float(loss.detach().cpu().item())
     
 
