@@ -100,11 +100,11 @@ class ReplayBuffer:
 class DQNAgent:
     
     """
-    off-policy、基于价值、时序差分、经验回访
+    off-policy（异策略、target network）、基于价值、时序差分、经验回放、软更新
     todo : Soft Updates (Polyak Averaging)
     """
 
-    def __init__(self, lr=0.001, epsilon=0.5, batch_size=32, buffer_size=512, action_size=4, device='cuda',use_cnn=False,
+    def __init__(self, lr=0.001, epsilon=0.5,epsilon_decay=0.995,TAU=0.005, batch_size=32, buffer_size=512, action_size=4, device='cuda',use_cnn=False,
                  image_shape=(84, 84)):
         self.gamma = 0.99
         self.lr = lr
@@ -112,6 +112,8 @@ class DQNAgent:
         self.buffer_size = buffer_size
         self.batch_size = batch_size
         self.action_size = action_size
+        self.epsilon_decay = epsilon_decay
+        self.TAU = TAU  # 软更新参数，可以让目标网络参数变化更加平滑，避免训练过程中的不稳定和震荡。
 
         self._device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.use_cnn = use_cnn
@@ -130,24 +132,25 @@ class DQNAgent:
             self.transforms = None
         self._replay_buffer = ReplayBuffer(self.buffer_size, self.batch_size, self.use_cnn,self.transforms,self._device)
 
-        self.qnet = QNet.to(self._device)
+        self.qnet_actor = QNet.to(self._device)
         self.qnet_target = QNet.to(self._device)
-        self.optimizer = optim.Adam(self.qnet.parameters(), lr=self.lr)
+        self.qnet_target.load_state_dict(self.qnet_actor.state_dict())
+        self.optimizer = optim.AdamW(self.qnet_actor.parameters(), lr=self.lr)
         self.scheduler = CosineAnnealingLR(self.optimizer,T_max=5000)
         self.loss_fn = nn.SmoothL1Loss()
 
 
     def eval(self):
-        self.qnet.eval()
+        self.qnet_actor.eval()
     
     def train(self):
-        self.qnet.train()
+        self.qnet_actor.train()
 
     def save(self, path):
-        torch.save(self.qnet.state_dict(), path)
+        torch.save(self.qnet_actor.state_dict(), path)
     
     def load(self, path):
-        self.qnet.load_state_dict(torch.load(path))
+        self.qnet_actor.load_state_dict(torch.load(path))
 
     def get_action(self, state):
         # 如果是CNN，自动做transform
@@ -160,12 +163,11 @@ class DQNAgent:
         if state.ndim == 1:
             state_t = state_t.unsqueeze(0)
 
-        self.epsilon = max(0.01, self.epsilon * 0.995) # 探索衰减
         if np.random.rand() < self.epsilon:
             return np.random.choice(self.action_size), 0 # 动作，Q值(用0先代替)
         else:
             with torch.no_grad():
-                qs = self.qnet(state_t)
+                qs = self.qnet_actor(state_t)
                 if state.ndim == 1:
                     qs = qs.squeeze(0)
                     return qs.argmax().item(), 0 # 动作， Q值(用0先代替)
@@ -176,31 +178,40 @@ class DQNAgent:
         if len(self._replay_buffer) < self.batch_size:
             return 0.0
 
-        state, action, reward, next_state, done = self._replay_buffer.get_batch()
+        states, actions, rewards, next_states, dones = self._replay_buffer.get_batch()
         # CNN输入批量transform
         if not self.use_cnn:
-            state = torch.FloatTensor(state) if not torch.is_tensor(state) else state
-            next_state = torch.FloatTensor(next_state) if not torch.is_tensor(next_state) else next_state
+            states = torch.FloatTensor(states) if not torch.is_tensor(states) else states
+            next_states = torch.FloatTensor(next_states) if not torch.is_tensor(next_states) else next_states
 
-        qs = self.qnet(state)
-        q = qs.gather(1, action.unsqueeze(1)).squeeze(1)
+        qs = self.qnet_actor(states)
+        q_actor = qs.gather(1, actions.unsqueeze(1)).squeeze(1)
 
         with torch.no_grad():
-            next_qs = self.qnet_target(next_state)
+            next_qs = self.qnet_target(next_states)
             next_q = next_qs.max(dim=1)[0]
-            target = reward + (1 - done) * self.gamma * next_q
+            q_target = rewards + (1 - dones) * self.gamma * next_q
 
-        loss = self.loss_fn(q, target)
+        loss = self.loss_fn(q_actor, q_target)
 
         self.optimizer.zero_grad()
         loss.backward()
+        
+        # 原地梯度裁剪
+        torch.nn.utils.clip_grad_value_(self.qnet_actor.parameters(), 100)
+
         self.optimizer.step()
-        self.scheduler.step()
+        # self.scheduler.step()
+        self.sync_qnet()
 
         return loss.item()
 
     def sync_qnet(self):
-        self.qnet_target.load_state_dict(self.qnet.state_dict())
+        for target_param, actor_param in zip(self.qnet_target.parameters(), self.qnet_actor.parameters()):
+            target_param.data.copy_(self.TAU * actor_param.data + (1.0 - self.TAU) * target_param.data)
+
+    def epsilon_update(self):
+        self.epsilon = max(0.01, self.epsilon * self.epsilon_decay) # 探索衰减
 
 
 
