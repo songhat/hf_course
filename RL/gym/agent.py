@@ -6,7 +6,7 @@ import numpy as np
 from collections import deque
 import random
 from torchvision import transforms
-from network import MLP_QNet, CNN_QNet, PolicyNet, ValueNet
+from network import MLP_QNet, CNN_QNet, PolicyNet, NaivePolicyNet, ValueNet
 from torch.distributions import Categorical
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -113,6 +113,7 @@ class DQNAgent:
         self.batch_size = batch_size
         self.action_size = action_size
         self.epsilon_decay = epsilon_decay
+        self.exploitation = True
         self.TAU = TAU  # 软更新参数，可以让目标网络参数变化更加平滑，避免训练过程中的不稳定和震荡。
 
         self._device = torch.device(device if torch.cuda.is_available() else 'cpu')
@@ -141,9 +142,11 @@ class DQNAgent:
 
 
     def eval(self):
+        self.exploitation = False
         self.qnet_actor.eval()
     
     def train(self):
+        self.exploitation = True
         self.qnet_actor.train()
 
     def save(self, path):
@@ -163,7 +166,7 @@ class DQNAgent:
         if state.ndim == 1:
             state_t = state_t.unsqueeze(0)
 
-        if np.random.rand() < self.epsilon:
+        if np.random.rand() < self.epsilon and self.exploitation: # e-greedy
             return np.random.choice(self.action_size), 0 # 动作，Q值(用0先代替)
         else:
             with torch.no_grad():
@@ -172,7 +175,7 @@ class DQNAgent:
                     qs = qs.squeeze(0)
                     return qs.argmax().item(), 0 # 动作， Q值(用0先代替)
                 else:
-                    return qs.argmax().item(), 0 # 动作， Q值(用0先代替)
+                    return qs.argmax(dim=1).tolist(), 0 # 动作， Q值(用0先代替)
     def update(self, state, action, reward, next_state, done):
         self._replay_buffer.add(state, action, reward, next_state, done)
         if len(self._replay_buffer) < self.batch_size:
@@ -199,9 +202,7 @@ class DQNAgent:
         
         # 原地梯度裁剪
         torch.nn.utils.clip_grad_value_(self.qnet_actor.parameters(), 100)
-
         self.optimizer.step()
-        # self.scheduler.step()
         self.sync_qnet()
 
         return loss.item()
@@ -212,8 +213,6 @@ class DQNAgent:
 
     def epsilon_update(self):
         self.epsilon = max(0.01, self.epsilon * self.epsilon_decay) # 探索衰减
-
-
 
 
 class REINFORCE:
@@ -288,29 +287,34 @@ class ActorCritic:
 
         self._device = device
         self.loss_fn = nn.MSELoss()
-        self.pi = PolicyNet(self.action_size).to(self._device)
+        self.pi = NaivePolicyNet(self.action_size).to(self._device)
         self.v = ValueNet().to(self._device)
         self.optimizer_pi = optim.Adam(self.pi.parameters(), lr=self.lr_pi)
         self.optimizer_v = optim.Adam(self.v.parameters(), lr=self.lr_v)
 
     def get_action(self, state):
-        state = state[np.newaxis, :]  # add batch axis
-        state = torch.FloatTensor(state) if not torch.is_tensor(state) else state
-        state = state.to(self._device)
-        probs = self.pi(state)
-        probs = probs[0]
-        
-        m = Categorical(probs=probs)
-        action = m.sample().item()
-        return action, probs
+        state_t = state if torch.is_tensor(state) else torch.as_tensor(state, dtype=torch.float32)
+        if state.ndim == 1:
+            state_t = state_t.unsqueeze(0)
+        state_t = state_t.to(self._device)
+        probs = self.pi(state_t)  # (A,)
 
-    def update(self, state, action, action_probs, reward, next_state, done):
+        m = Categorical(probs=probs)
+        actions = m.sample() 
+        
+        if state.ndim == 1:
+            return actions.item(), probs.squeeze(0)
+        else:
+            return actions.cpu().numpy(), probs
+            
+    
+    def update(self, state, action, probs, reward, next_state, done):
         state = state[np.newaxis, :]  # add batch axis
         next_state = next_state[np.newaxis, :]
         
         state = torch.tensor(state, dtype=torch.float32).to(self._device)
         next_state = torch.tensor(next_state, dtype=torch.float32).to(self._device)
-        action_prob = action_probs[action]
+        action_prob = probs[action]
         reward = torch.tensor(reward, dtype=torch.float32).to(self._device)
         done = torch.tensor(done, dtype=torch.float32).to(self._device)
 
@@ -336,3 +340,64 @@ class ActorCritic:
         self.optimizer_pi.zero_grad()
         loss_pi.backward()
         self.optimizer_pi.step()
+
+        return {"actor_loss": loss_pi.item(), "critic_loss": loss_v.item()}
+
+
+class A2C(ActorCritic):
+    """
+        ActorCritic同步并行版
+    """
+    def __init__(self, lr_pi: float = 0.0002, lr_v: float = 0.0005, action_size: int = 2, gamma: float = 0.98, device: str | None = None):
+        self.gamma = gamma
+        self.lr_pi = lr_pi
+        self.lr_v = lr_v
+        self.action_size = action_size
+
+        self._device = device
+        self.loss_fn = nn.SmoothL1Loss()
+        self.pi = NaivePolicyNet(self.action_size).to(self._device)
+        self.v = ValueNet().to(self._device)
+        self.optimizer_pi = optim.Adam(self.pi.parameters(), lr=self.lr_pi)
+        self.optimizer_v = optim.Adam(self.v.parameters(), lr=self.lr_v)
+
+    def get_action(self, state):
+        state_t = state if torch.is_tensor(state) else torch.as_tensor(state, dtype=torch.float32)
+        state_t = state_t.to(self._device)
+        probs = self.pi(state_t) #(B,A)
+        m = Categorical(probs=probs)
+        actions = m.sample() 
+        
+        return actions.cpu().detach().numpy(), probs
+            
+    def update(self, state, action, probs, reward, next_state, done):
+        state = torch.tensor(state, dtype=torch.float32).to(self._device)
+        next_state = torch.tensor(next_state, dtype=torch.float32).to(self._device)
+        action = torch.tensor(action, dtype=torch.int64).to(self._device)   
+        probs = probs.gather(1, action.unsqueeze(1)).squeeze(1)
+        reward = torch.tensor(reward, dtype=torch.float32).to(self._device)
+        done = torch.tensor(done, dtype=torch.float32).to(self._device)
+
+        # ========== (1) Update V network ===========
+        with torch.no_grad():
+            target = reward + (self.gamma * self.v(next_state) * (1 - done)).squeeze(1)
+        
+        v = self.v(state).squeeze(1)
+        loss_v = self.loss_fn(v, target)
+
+        # ========== (2) Update pi network ===========
+        with torch.no_grad():
+            delta = target - v
+
+        loss_pi = -torch.sum(torch.log(probs + 1e-8) * delta)
+
+        # 分别更新两个网络
+        self.optimizer_v.zero_grad()
+        loss_v.backward()
+        self.optimizer_v.step()
+
+        self.optimizer_pi.zero_grad()
+        loss_pi.backward()
+        self.optimizer_pi.step()
+
+        return {"actor_loss": loss_pi.item(), "critic_loss": loss_v.item()}
