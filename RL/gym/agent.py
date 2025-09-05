@@ -100,8 +100,7 @@ class ReplayBuffer:
 class DQNAgent:
     
     """
-    off-policy（异策略、target network）、基于价值、时序差分、经验回放、软更新
-    todo : Soft Updates (Polyak Averaging)
+    off-policy（异策略、target network）、基于价值、时序差分、经验回放、软更新、梯度裁剪
     """
 
     def __init__(self, lr=0.001, epsilon=0.5,epsilon_decay=0.995,TAU=0.005, batch_size=32, buffer_size=512, action_size=4, device='cuda',use_cnn=False,
@@ -348,7 +347,7 @@ class A2C(ActorCritic):
     """
         ActorCritic同步并行版
     """
-    def __init__(self, lr_pi: float = 0.0002, lr_v: float = 0.0005, action_size: int = 2, gamma: float = 0.98, device: str | None = None):
+    def __init__(self, lr_pi: float = 0.0002, lr_v: float = 0.0005, action_size: int = 2, gamma: float = 0.98, device: str | None = None, **kwargs):
         self.gamma = gamma
         self.lr_pi = lr_pi
         self.lr_v = lr_v
@@ -358,8 +357,24 @@ class A2C(ActorCritic):
         self.loss_fn = nn.SmoothL1Loss()
         self.pi = NaivePolicyNet(self.action_size).to(self._device)
         self.v = ValueNet().to(self._device)
-        self.optimizer_pi = optim.Adam(self.pi.parameters(), lr=self.lr_pi)
-        self.optimizer_v = optim.Adam(self.v.parameters(), lr=self.lr_v)
+        self.optimizer_pi = optim.AdamW(self.pi.parameters(), lr=self.lr_pi)
+        self.optimizer_v = optim.AdamW(self.v.parameters(), lr=self.lr_v)
+
+    def eval(self):
+        self.pi.eval()
+        self.v.eval()
+    
+    def train(self):
+        self.pi.train()
+        self.v.train()
+
+    def save(self, path):
+        torch.save(self.pi.state_dict(), path + ".pi")
+        torch.save(self.v.state_dict(), path + ".v")
+
+    def load(self, path):
+        self.pi.load_state_dict(torch.load(path + ".pi"))
+        self.v.load_state_dict(torch.load(path + ".v"))
 
     def get_action(self, state):
         state_t = state if torch.is_tensor(state) else torch.as_tensor(state, dtype=torch.float32)
@@ -380,7 +395,7 @@ class A2C(ActorCritic):
 
         # ========== (1) Update V network ===========
         with torch.no_grad():
-            target = reward + (self.gamma * self.v(next_state) * (1 - done)).squeeze(1)
+            target = reward + self.gamma * self.v(next_state).squeeze(1) * (1 - done)
         
         v = self.v(state).squeeze(1)
         loss_v = self.loss_fn(v, target)
@@ -394,10 +409,12 @@ class A2C(ActorCritic):
         # 分别更新两个网络
         self.optimizer_v.zero_grad()
         loss_v.backward()
+        # torch.nn.utils.clip_grad_value_(self.v.parameters(), 100)
         self.optimizer_v.step()
 
         self.optimizer_pi.zero_grad()
         loss_pi.backward()
+        # torch.nn.utils.clip_grad_value_(self.pi.parameters(), 100)
         self.optimizer_pi.step()
 
         return {"actor_loss": loss_pi.item(), "critic_loss": loss_v.item()}
