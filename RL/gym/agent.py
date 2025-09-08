@@ -347,7 +347,7 @@ class A2C(ActorCritic):
     """
         ActorCritic同步并行版
     """
-    def __init__(self, lr_pi: float = 0.0002, lr_v: float = 0.0005, action_size: int = 2, gamma: float = 0.98, device: str | None = None, **kwargs):
+    def __init__(self, lr_pi: float = 0.0002, lr_v: float = 0.0005, action_size: int = 2, gamma: float = 0.99, device: str | None = None, **kwargs):
         self.gamma = gamma
         self.lr_pi = lr_pi
         self.lr_v = lr_v
