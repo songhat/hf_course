@@ -409,12 +409,10 @@ class A2C(ActorCritic):
         # 分别更新两个网络
         self.optimizer_v.zero_grad()
         loss_v.backward()
-        # torch.nn.utils.clip_grad_value_(self.v.parameters(), 100)
         self.optimizer_v.step()
 
         self.optimizer_pi.zero_grad()
         loss_pi.backward()
-        # torch.nn.utils.clip_grad_value_(self.pi.parameters(), 100)
         self.optimizer_pi.step()
 
         return {"actor_loss": loss_pi.item(), "critic_loss": loss_v.item()}
