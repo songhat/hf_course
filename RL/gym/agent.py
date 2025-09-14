@@ -354,7 +354,7 @@ class A2C(ActorCritic):
         self.action_size = action_size
 
         self._device = device
-        self.loss_fn = nn.SmoothL1Loss()
+        self.loss_fn = nn.MSELoss()
         self.pi = NaivePolicyNet(self.action_size).to(self._device)
         self.v = ValueNet().to(self._device)
         self.optimizer_pi = optim.AdamW(self.pi.parameters(), lr=self.lr_pi)
@@ -414,5 +414,5 @@ class A2C(ActorCritic):
         self.optimizer_pi.zero_grad()
         loss_pi.backward()
         self.optimizer_pi.step()
-
         return {"actor_loss": loss_pi.item(), "critic_loss": loss_v.item()}
+

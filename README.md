@@ -6,13 +6,13 @@
 
 ## 强化学习
 
-目前针对回合制环境（lunar lander v3）实现了效果不错的算法：
+目前针对回合制离散动作环境（lunar lander v3）实现了效果不错的算法：
 
 * DNQ
 
 * REINFORCE
 
-* A2C (todo 训练不中断bug)
+* A2C
 
 目前发现一些调参技巧：
 

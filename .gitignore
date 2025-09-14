@@ -108,6 +108,7 @@ transformers_cache/
 RL/ml-agents/
 RL/results/
 RL/gym/runs/
+RL/gym/__pycache__
 RL/logs/
 RL/trained-envs-executables/
 RL/ppo-LunarLander-v2.zip
