@@ -6,7 +6,7 @@ import numpy as np
 from collections import deque
 import random
 from torchvision import transforms
-from network import MLP_QNet, CNN_QNet, PolicyNet, NaivePolicyNet, ValueNet
+from network import MLP_QNet, CNN_QNet, PolicyNet, NaivePolicyNet, PolicyValueNet, ValueNet
 from torch.distributions import Categorical
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -347,72 +347,95 @@ class A2C(ActorCritic):
     """
         ActorCritic同步并行版
     """
-    def __init__(self, lr_pi: float = 0.0002, lr_v: float = 0.0005, action_size: int = 2, gamma: float = 0.99, device: str | None = None, **kwargs):
-        self.gamma = gamma
-        self.lr_pi = lr_pi
-        self.lr_v = lr_v
+    def __init__(self, 
+                lr: float = 7e-4,
+                action_size: int = 2,
+                gamma: float = 0.99,
+                max_grad_norm: float = 0.5,
+                policy_coef: float = 1,
+                value_coef: float = 0.5,
+                entropy_coef: float = 0.05,
+                device: str | None = None,
+                **kwargs):
+        self.lr = lr
         self.action_size = action_size
-
+        self.gamma = gamma
+        self.max_grad_norm = max_grad_norm
+        self.policy_coef = policy_coef
+        self.value_coef = value_coef
+        self.entropy_coef = entropy_coef
+        self.deterministic = False
+        
         self._device = device
         self.loss_fn = nn.MSELoss()
-        self.pi = NaivePolicyNet(self.action_size).to(self._device)
-        self.v = ValueNet().to(self._device)
-        self.optimizer_pi = optim.AdamW(self.pi.parameters(), lr=self.lr_pi)
-        self.optimizer_v = optim.AdamW(self.v.parameters(), lr=self.lr_v)
+        self.network = PolicyValueNet(self.action_size).to(self._device)
+        self.optimizer = optim.Adam(self.network.parameters(), lr=self.lr)
+
 
     def eval(self):
-        self.pi.eval()
-        self.v.eval()
+        self.network.eval()
+        self.deterministic = True
     
     def train(self):
-        self.pi.train()
-        self.v.train()
+        self.network.train()
+        self.deterministic = False
 
     def save(self, path):
-        torch.save(self.pi.state_dict(), path + ".pi")
-        torch.save(self.v.state_dict(), path + ".v")
+        torch.save(self.network.state_dict(), path + ".network")
 
     def load(self, path):
-        self.pi.load_state_dict(torch.load(path + ".pi"))
-        self.v.load_state_dict(torch.load(path + ".v"))
+        self.network.load_state_dict(torch.load(path + ".network"))
 
     def get_action(self, state):
         state_t = state if torch.is_tensor(state) else torch.as_tensor(state, dtype=torch.float32)
         state_t = state_t.to(self._device)
-        probs = self.pi(state_t) #(B,A)
-        m = Categorical(probs=probs)
-        actions = m.sample() 
-        
-        return actions.cpu().detach().numpy(), probs
-            
-    def update(self, state, action, probs, reward, next_state, done):
+        action_probs, values = self.network(state_t) #(B,A)
+        m = Categorical(probs=action_probs)
+        actions = m.sample() if not self.deterministic else action_probs.argmax(dim=-1)
+
+        return actions.cpu().detach().numpy(), action_probs, values
+
+    def update(self, state, action, action_probs, values, reward, next_state, done):
         state = torch.tensor(state, dtype=torch.float32).to(self._device)
         next_state = torch.tensor(next_state, dtype=torch.float32).to(self._device)
         action = torch.tensor(action, dtype=torch.int64).to(self._device)   
-        probs = probs.gather(1, action.unsqueeze(1)).squeeze(1)
+        selected_action_probs = action_probs.gather(1, action.unsqueeze(1)).squeeze(1)
+        values = values.squeeze(1)
         reward = torch.tensor(reward, dtype=torch.float32).to(self._device)
         done = torch.tensor(done, dtype=torch.float32).to(self._device)
 
         # ========== (1) Update V network ===========
         with torch.no_grad():
-            target = reward + self.gamma * self.v(next_state).squeeze(1) * (1 - done)
-        
-        v = self.v(state).squeeze(1)
-        loss_v = self.loss_fn(v, target)
+            """
+                TD算法通过one-step bootstrapping来计算回报
+                蒙特卡洛算法通过实际的回合回报来计算回报
+            """
+            _, next_values = self.network(next_state)
+            returns = reward + self.gamma * next_values.squeeze(1) * (1 - done) # bootstrapping
+
+        loss_v = self.loss_fn(values, returns)
 
         # ========== (2) Update pi network ===========
         with torch.no_grad():
-            delta = target - v
+            advantages = returns - values
 
-        loss_pi = -torch.sum(torch.log(probs + 1e-8) * delta)
+        loss_pi = -torch.mean(torch.log(selected_action_probs + 1e-8) * advantages)
 
-        # 分别更新两个网络
-        self.optimizer_v.zero_grad()
-        loss_v.backward()
-        self.optimizer_v.step()
+        """
+            策略越随机,说明探索性越大, 熵越大
+            探索的越多，价值模型估计越准确，收敛的越好，策略模型不会过早收敛到某个确定动作,
+            和在探索率内的随机动作不一样，这里控制的是策略动作分布的随机性，让探索动作的输出更合理
+        """
+        loss_entropy = torch.mean(
+            -torch.sum(action_probs * torch.log(action_probs + 1e-8),dim=1), dim=0)
 
-        self.optimizer_pi.zero_grad()
-        loss_pi.backward()
-        self.optimizer_pi.step()
-        return {"actor_loss": loss_pi.item(), "critic_loss": loss_v.item()}
+        loss = self.policy_coef * loss_pi + self.value_coef * loss_v - self.entropy_coef * loss_entropy
+
+         # 统一更新 
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
+        self.optimizer.step()
+
+        return {"actor_loss": loss_pi.item(), "critic_loss": loss_v.item(), "entropy_loss": loss_entropy.item()}
 

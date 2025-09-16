@@ -108,3 +108,23 @@ class ValueNet(nn.Module):
         x = F.relu(self.l1(x))
         x = self.l2(x)
         return x
+
+class PolicyValueNet(nn.Module):
+    def __init__(self, action_size: int):
+        super().__init__()
+        self.l1 = nn.LazyLinear(128)
+        self.l2 = nn.LazyLinear(128)
+
+        # 策略网络部分
+        self.policy_head = nn.LazyLinear(action_size)
+        # 价值网络部分
+        self.value_head = nn.LazyLinear(1)
+
+    def forward(self, x):
+        x = F.relu(self.l1(x))
+        x = F.relu(self.l2(x))
+
+        policy = F.softmax(self.policy_head(x), dim=-1)
+        value = self.value_head(x)
+        return policy, value
+    
